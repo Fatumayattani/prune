@@ -1,17 +1,25 @@
-// Renders a TreeModel as two meshes (branches and leaves), skipping any
-// branches that have been cut. Geometry code ported from EZ-Tree
+// Renders a TreeModel. Cut branches are hidden, and a selected branch (with
+// everything growing from it) is drawn highlighted so the player can see
+// what a cut would remove. Geometry code ported from EZ-Tree
 // (MIT, Daniel Greenheck).
 
 import * as THREE from 'three'
 import {leafQuads, type TreeModel} from '../../shared/tree/model.ts'
+import type {Point, Target} from './pick.ts'
 import {barkTextures, leafTexture} from './textures.ts'
 import {addWind} from './wind.ts'
 
+const HIGHLIGHT = 0xff5a3c
+
+type Mesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhongMaterial>
+
 export class TreeView extends THREE.Group {
   readonly model: TreeModel
-  readonly #branches: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhongMaterial>
-  readonly #leaves: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhongMaterial>
-  readonly #time: {value: number}
+  readonly #branches: Mesh
+  readonly #leaves: Mesh
+  readonly #selectedBranches: Mesh
+  readonly #selectedLeaves: Mesh
+  readonly #time = {value: 0}
 
   constructor(model: TreeModel) {
     super()
@@ -38,24 +46,71 @@ export class TreeView extends THREE.Group {
       alphaTest: leaves.alphaTest,
       dithering: true,
     })
-    this.#time = addWind(leafMaterial)
+    addWind(leafMaterial, this.#time)
 
-    this.#branches = new THREE.Mesh(new THREE.BufferGeometry(), barkMaterial)
-    this.#leaves = new THREE.Mesh(new THREE.BufferGeometry(), leafMaterial)
-    for (const mesh of [this.#branches, this.#leaves]) {
-      mesh.castShadow = true
-      mesh.receiveShadow = true
-      this.add(mesh)
-    }
-    this.show(new Set())
+    const selectedBark = barkMaterial.clone()
+    selectedBark.color.set(HIGHLIGHT)
+    selectedBark.emissive.set(HIGHLIGHT).multiplyScalar(0.35)
+    const selectedLeaf = leafMaterial.clone()
+    selectedLeaf.color.set(HIGHLIGHT)
+    selectedLeaf.emissive.set(HIGHLIGHT).multiplyScalar(0.35)
+    addWind(selectedLeaf, this.#time)
+
+    this.#branches = mesh(barkMaterial)
+    this.#leaves = mesh(leafMaterial)
+    this.#selectedBranches = mesh(selectedBark)
+    this.#selectedLeaves = mesh(selectedLeaf)
+    this.add(
+      this.#branches,
+      this.#leaves,
+      this.#selectedBranches,
+      this.#selectedLeaves,
+    )
+    this.show(new Set(), new Set())
   }
 
-  /** Rebuilds the geometry without the removed branches. */
-  show(removed: ReadonlySet<number>): void {
-    this.#branches.geometry.dispose()
-    this.#branches.geometry = branchGeometry(this.model, removed)
-    this.#leaves.geometry.dispose()
-    this.#leaves.geometry = leafGeometry(this.model, removed)
+  /** Rebuilds the geometry: removed branches hidden, selected highlighted. */
+  show(removed: ReadonlySet<number>, selected: ReadonlySet<number>): void {
+    const normal = (id: number) => !removed.has(id) && !selected.has(id)
+    const highlighted = (id: number) => !removed.has(id) && selected.has(id)
+    replace(this.#branches, branchGeometry(this.model, normal))
+    replace(this.#leaves, leafGeometry(this.model, normal))
+    replace(this.#selectedBranches, branchGeometry(this.model, highlighted))
+    replace(this.#selectedLeaves, leafGeometry(this.model, highlighted))
+  }
+
+  /**
+   * Screen-space tap targets for every branch still on the tree: a line
+   * along each branch plus a point at each leaf, in CSS pixels.
+   */
+  targets(
+    camera: THREE.Camera,
+    width: number,
+    height: number,
+    removed: ReadonlySet<number>,
+  ): Target[] {
+    this.updateMatrixWorld()
+    const toScreen = (v: THREE.Vector3): Point => {
+      const p = v.clone().applyMatrix4(this.matrixWorld).project(camera)
+      return [((p.x + 1) / 2) * width, ((1 - p.y) / 2) * height]
+    }
+
+    const targets: Target[] = []
+    for (const branch of this.model.branches) {
+      if (removed.has(branch.id)) continue
+      targets.push({
+        branch: branch.id,
+        points: branch.sections.map(section => toScreen(section.origin)),
+      })
+    }
+    for (const leaf of this.model.leaves) {
+      if (removed.has(leaf.branch)) continue
+      const center = new THREE.Vector3(0, leaf.size / 2, 0)
+        .applyEuler(leaf.orientation)
+        .add(leaf.origin)
+      targets.push({branch: leaf.branch, points: [toScreen(center)]})
+    }
+    return targets
   }
 
   update(elapsedSeconds: number): void {
@@ -63,16 +118,33 @@ export class TreeView extends THREE.Group {
   }
 
   dispose(): void {
-    for (const mesh of [this.#branches, this.#leaves]) {
-      mesh.geometry.dispose()
-      mesh.material.dispose()
+    for (const m of [
+      this.#branches,
+      this.#leaves,
+      this.#selectedBranches,
+      this.#selectedLeaves,
+    ]) {
+      m.geometry.dispose()
+      m.material.dispose()
     }
   }
 }
 
+function mesh(material: THREE.MeshPhongMaterial): Mesh {
+  const m = new THREE.Mesh(new THREE.BufferGeometry(), material)
+  m.castShadow = true
+  m.receiveShadow = true
+  return m
+}
+
+function replace(m: Mesh, geometry: THREE.BufferGeometry): void {
+  m.geometry.dispose()
+  m.geometry = geometry
+}
+
 function branchGeometry(
   model: TreeModel,
-  removed: ReadonlySet<number>,
+  include: (branchId: number) => boolean,
 ): THREE.BufferGeometry {
   const verts: number[] = []
   const normals: number[] = []
@@ -80,7 +152,7 @@ function branchGeometry(
   const indices: number[] = []
 
   for (const branch of model.branches) {
-    if (removed.has(branch.id)) continue
+    if (!include(branch.id)) continue
     const offset = verts.length / 3
     const n = branch.segmentCount
 
@@ -126,7 +198,7 @@ function branchGeometry(
 
 function leafGeometry(
   model: TreeModel,
-  removed: ReadonlySet<number>,
+  include: (branchId: number) => boolean,
 ): THREE.BufferGeometry {
   const verts: number[] = []
   const uvs: number[] = []
@@ -134,7 +206,7 @@ function leafGeometry(
   const quads = leafQuads(model.options)
 
   for (const leaf of model.leaves) {
-    if (removed.has(leaf.branch)) continue
+    if (!include(leaf.branch)) continue
     const w = leaf.size
     const l = leaf.size
     for (let q = 0; q < quads; q++) {

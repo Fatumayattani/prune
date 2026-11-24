@@ -1,15 +1,25 @@
 import * as THREE from 'three'
-import {removedBranches} from '../shared/tree/cut.ts'
+import {remainingLeafCount, subtree} from '../shared/tree/cut.ts'
+import {CutHistory} from '../shared/tree/history.ts'
 import {generateTree} from '../shared/tree/model.ts'
 import {SPECIES, type Species, treeOptions} from '../shared/tree/species.ts'
+import {pickBranch} from './tree/pick.ts'
 import {TreeView} from './tree/view.ts'
 
-// Temporary test scene: draws the day's tree from our own generator.
-// Tap to cut a random branch; double-tap to change species or seed.
-// Real cutting controls come in the next PR.
+// Tap a branch to select it (it turns red with everything growing from it),
+// tap it again to cut. Tap empty space to deselect. Undo takes back a cut.
+
+/** How far from a branch a tap still counts, in CSS pixels. */
+const TAP_REACH = 28
+/** A press that moves further than this is a drag, not a tap. */
+const TAP_SLOP = 10
 
 const canvas = document.getElementById('scene') as HTMLCanvasElement
 const stats = document.getElementById('stats') as HTMLPreElement
+const hint = document.getElementById('hint') as HTMLParagraphElement
+const undoButton = document.getElementById('undo') as HTMLButtonElement
+const cutsLabel = document.getElementById('cuts') as HTMLSpanElement
+const nextTreeButton = document.getElementById('next-tree') as HTMLButtonElement
 
 const renderer = new THREE.WebGLRenderer({antialias: true, canvas})
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -38,7 +48,8 @@ scene.add(ground)
 let speciesIndex = 0
 let seed = dailySeed(new Date())
 let view: TreeView | undefined
-let cuts: number[] = []
+let history: CutHistory | undefined
+let selected: number | undefined
 let info = ''
 
 function dailySeed(date: Date): number {
@@ -50,30 +61,61 @@ function dailySeed(date: Date): number {
 
 function buildTree(): void {
   const species: Species = SPECIES[speciesIndex] ?? 'oak'
-  const started = performance.now()
   const model = generateTree(treeOptions(species, seed))
   if (view) {
     scene.remove(view)
     view.dispose()
   }
   view = new TreeView(model)
+  history = new CutHistory(model)
+  selected = undefined
   scene.add(view)
-  cuts = []
-  const ms = performance.now() - started
-  info = `${species} · seed ${seed} · built in ${ms.toFixed(0)} ms`
+  info = `${species} · seed ${seed}`
   frameCamera()
+  refresh()
 }
 
-function cutRandomBranch(): void {
-  if (!view) return
-  const candidates = view.model.branches.filter(b => b.level > 0)
-  const pick = candidates[Math.floor(Math.random() * candidates.length)]
-  if (!pick) return
+/** Redraws the tree and updates the text and buttons to match the state. */
+function refresh(): void {
+  if (!view || !history) return
   const started = performance.now()
-  cuts.push(pick.id)
-  view.show(removedBranches(view.model, cuts))
+  const selection =
+    selected === undefined ? new Set<number>() : subtree(view.model, selected)
+  view.show(history.removed, selection)
   const ms = performance.now() - started
-  info = `${info.split('\n')[0]}\ncut branch ${pick.id} · rebuilt in ${ms.toFixed(0)} ms`
+
+  const count = history.cuts.length
+  cutsLabel.textContent = `${count} ${count === 1 ? 'cut' : 'cuts'}`
+  undoButton.disabled = count === 0
+
+  if (selected === undefined) {
+    hint.textContent = 'Tap a branch to select it'
+  } else {
+    const before = remainingLeafCount(view.model, history.removed)
+    const after = remainingLeafCount(
+      view.model,
+      new Set([...history.removed, ...selection]),
+    )
+    hint.textContent = `Tap again to cut · removes ${before - after} leaves`
+  }
+  info = `${info.split('\n')[0]}\nrebuilt in ${ms.toFixed(0)} ms`
+}
+
+function onTap(x: number, y: number): void {
+  if (!view || !history) return
+  const rect = canvas.getBoundingClientRect()
+  const targets = view
+    .targets(camera, rect.width, rect.height, history.removed)
+    .filter(target => history?.canCut(target.branch))
+  const picked = pickBranch(targets, [x - rect.left, y - rect.top], TAP_REACH)
+
+  if (picked !== undefined && picked === selected) {
+    history.cut(picked)
+    selected = undefined
+  } else {
+    selected = picked
+  }
+  refresh()
 }
 
 function frameCamera(): void {
@@ -97,26 +139,39 @@ function resize(): void {
   frameCamera()
 }
 
-let lastTap = 0
-canvas.addEventListener('pointerup', () => {
-  const now = performance.now()
-  if (now - lastTap < 300) {
-    speciesIndex = (speciesIndex + 1) % SPECIES.length
-    if (speciesIndex === 0) seed += 1
-    buildTree()
-    lastTap = 0
-    return
-  }
-  lastTap = now
-  cutRandomBranch()
+let pressStart: {x: number; y: number} | undefined
+canvas.addEventListener('pointerdown', event => {
+  pressStart = {x: event.clientX, y: event.clientY}
+})
+canvas.addEventListener('pointerup', event => {
+  if (!pressStart) return
+  const moved = Math.hypot(
+    event.clientX - pressStart.x,
+    event.clientY - pressStart.y,
+  )
+  pressStart = undefined
+  if (moved <= TAP_SLOP) onTap(event.clientX, event.clientY)
+})
+canvas.addEventListener('pointercancel', () => {
+  pressStart = undefined
+})
+
+undoButton.addEventListener('click', () => {
+  history?.undo()
+  selected = undefined
+  refresh()
+})
+
+nextTreeButton.addEventListener('click', () => {
+  speciesIndex = (speciesIndex + 1) % SPECIES.length
+  if (speciesIndex === 0) seed += 1
+  buildTree()
 })
 
 let frames = 0
 let lastFpsTime = performance.now()
-const clock = new THREE.Clock()
-
-function animate(): void {
-  view?.update(clock.getElapsedTime())
+function animate(time: number): void {
+  view?.update(time / 1000)
   renderer.render(scene, camera)
 
   frames += 1
@@ -126,7 +181,7 @@ function animate(): void {
     frames = 0
     lastFpsTime = now
     const tris = renderer.info.render.triangles
-    stats.textContent = `${info}\n${fps} fps · ${tris.toLocaleString()} tris\ntap: cut · double-tap: next tree`
+    stats.textContent = `${info}\n${fps} fps · ${tris.toLocaleString()} tris`
   }
 }
 

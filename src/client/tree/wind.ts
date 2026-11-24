@@ -69,9 +69,14 @@ mvPosition = modelViewMatrix * mvPosition;
 gl_Position = projectionMatrix * mvPosition;
 `
 
-/** Adds wind sway to a material. Returns the time uniform to update each frame. */
-export function addWind(material: THREE.Material): {value: number} {
-  const time = {value: 0}
+/**
+ * Adds wind sway to a material. Pass the same time uniform to several
+ * materials to keep them swaying together. Update its value each frame.
+ */
+export function addWind(
+  material: THREE.Material,
+  time: {value: number} = {value: 0},
+): {value: number} {
   material.onBeforeCompile = shader => {
     shader.uniforms.uTime = time
     shader.uniforms.uWindStrength = {value: new THREE.Vector3(0.5, 0, 0.5)}
