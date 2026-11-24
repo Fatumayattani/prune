@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, maximum-scale=1, minimum-scale=1, user-scalable=no"
     >
-    <title>Game</title>
+    <title>Prune</title>
     <link rel="modulepreload" href="game.js">
     <style>
     body {
@@ -14,24 +14,34 @@
       width: 100dvw;
       height: 100dvh;
       overflow: hidden;
-      display: grid;
-      place-items: center;
+      background: #e9e4d8;
+      font-family: system-ui, sans-serif;
     }
-    main {
-      display: grid;
-      gap: 1rem;
-      justify-items: center;
+    #scene {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+    #stats {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      margin: 0;
+      padding: 6px 8px;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #f5f1e8;
+      background: rgb(0 0 0 / 0.55);
+      border-radius: 6px;
+      white-space: pre;
+      pointer-events: none;
     }
     </style>
   </head>
   <body>
-    <main>
-      <div class="counter">
-        <button id="dec-btn" type="button">-</button>
-        <output id="counter">0</output>
-        <button id="inc-btn" type="button">+</button>
-      </div>
-    </main>
+    <canvas id="scene"></canvas>
+    <pre id="stats">Loading…</pre>
     <script src="game.js" type="module"></script>
   </body>
 </html>
