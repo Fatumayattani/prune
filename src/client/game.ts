@@ -3,7 +3,10 @@ import {remainingLeafCount, subtree} from '../shared/tree/cut.ts'
 import {CutHistory} from '../shared/tree/history.ts'
 import {generateTree} from '../shared/tree/model.ts'
 import {SPECIES, type Species, treeOptions} from '../shared/tree/species.ts'
+import {buzz, playSnip, playThud} from './sound.ts'
+import {CutEffects} from './tree/effects.ts'
 import {pickBranch} from './tree/pick.ts'
+import {stumpPose} from './tree/stump.ts'
 import {TreeView} from './tree/view.ts'
 
 // Tap a branch to select it (it turns red with everything growing from it),
@@ -45,6 +48,8 @@ ground.rotation.x = -Math.PI / 2
 ground.receiveShadow = true
 scene.add(ground)
 
+const effects = new CutEffects(scene, playThud)
+
 let speciesIndex = 0
 let seed = dailySeed(new Date())
 let view: TreeView | undefined
@@ -81,7 +86,7 @@ function refresh(): void {
   const started = performance.now()
   const selection =
     selected === undefined ? new Set<number>() : subtree(view.model, selected)
-  view.show(history.removed, selection)
+  view.show(history.removed, selection, history.cuts)
   const ms = performance.now() - started
 
   const count = history.cuts.length
@@ -110,12 +115,33 @@ function onTap(x: number, y: number): void {
   const picked = pickBranch(targets, [x - rect.left, y - rect.top], TAP_REACH)
 
   if (picked !== undefined && picked === selected) {
-    history.cut(picked)
-    selected = undefined
+    cut(picked)
   } else {
     selected = picked
   }
   refresh()
+}
+
+function cut(branchId: number): void {
+  if (!view || !history) return
+  const falling = new Set(
+    [...subtree(view.model, branchId)].filter(id => !history?.removed.has(id)),
+  )
+  const cutPoint =
+    stumpPose(view.model, branchId)?.position ??
+    view.model.branches[branchId]?.sections[0]?.origin
+  if (!history.cut(branchId) || !cutPoint) return
+  selected = undefined
+
+  effects.spawn(
+    view.detach(falling),
+    cutPoint.clone(),
+    view.leafCenters(falling),
+    view.leafMaterial,
+    view.model.options.leaves.size,
+  )
+  playSnip()
+  buzz()
 }
 
 function frameCamera(): void {
@@ -170,8 +196,12 @@ nextTreeButton.addEventListener('click', () => {
 
 let frames = 0
 let lastFpsTime = performance.now()
+let lastFrame = 0
 function animate(time: number): void {
+  const dt = lastFrame === 0 ? 0 : (time - lastFrame) / 1000
+  lastFrame = time
   view?.update(time / 1000)
+  effects.update(dt)
   renderer.render(scene, camera)
 
   frames += 1

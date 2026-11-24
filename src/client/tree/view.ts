@@ -1,11 +1,13 @@
-// Renders a TreeModel. Cut branches are hidden, and a selected branch (with
-// everything growing from it) is drawn highlighted so the player can see
-// what a cut would remove. Geometry code ported from EZ-Tree
-// (MIT, Daniel Greenheck).
+// Renders a TreeModel. Cut branches are hidden and their stumps show a cut
+// face, and a selected branch (with everything growing from it) is drawn
+// highlighted so the player can see what a cut would remove. Geometry code
+// ported from EZ-Tree (MIT, Daniel Greenheck).
 
 import * as THREE from 'three'
 import {leafQuads, type TreeModel} from '../../shared/tree/model.ts'
 import type {Point, Target} from './pick.ts'
+import {ringsTexture} from './rings.ts'
+import {stumpPose} from './stump.ts'
 import {barkTextures, leafTexture} from './textures.ts'
 import {addWind} from './wind.ts'
 
@@ -19,6 +21,8 @@ export class TreeView extends THREE.Group {
   readonly #leaves: Mesh
   readonly #selectedBranches: Mesh
   readonly #selectedLeaves: Mesh
+  readonly #stumps = new THREE.Group()
+  readonly #stumpMaterial: THREE.MeshPhongMaterial
   readonly #time = {value: 0}
 
   constructor(model: TreeModel) {
@@ -60,23 +64,116 @@ export class TreeView extends THREE.Group {
     this.#leaves = mesh(leafMaterial)
     this.#selectedBranches = mesh(selectedBark)
     this.#selectedLeaves = mesh(selectedLeaf)
+    this.#stumpMaterial = new THREE.MeshPhongMaterial({
+      name: 'stumps',
+      map: ringsTexture(),
+      shininess: 4,
+    })
     this.add(
       this.#branches,
       this.#leaves,
       this.#selectedBranches,
       this.#selectedLeaves,
+      this.#stumps,
     )
-    this.show(new Set(), new Set())
+    this.show(new Set(), new Set(), [])
   }
 
-  /** Rebuilds the geometry: removed branches hidden, selected highlighted. */
-  show(removed: ReadonlySet<number>, selected: ReadonlySet<number>): void {
+  /**
+   * Rebuilds the geometry: removed branches hidden, selected highlighted,
+   * and a cut face on every cut whose stump is still on the tree.
+   */
+  show(
+    removed: ReadonlySet<number>,
+    selected: ReadonlySet<number>,
+    cuts: readonly number[],
+  ): void {
     const normal = (id: number) => !removed.has(id) && !selected.has(id)
     const highlighted = (id: number) => !removed.has(id) && selected.has(id)
     replace(this.#branches, branchGeometry(this.model, normal))
     replace(this.#leaves, leafGeometry(this.model, normal))
     replace(this.#selectedBranches, branchGeometry(this.model, highlighted))
     replace(this.#selectedLeaves, leafGeometry(this.model, highlighted))
+    this.#showStumps(removed, cuts)
+  }
+
+  /**
+   * A separate copy of some branches and their leaves, sharing this tree's
+   * materials, for animating a cut piece as it falls.
+   */
+  detach(branchIds: ReadonlySet<number>): THREE.Group {
+    const include = (id: number) => branchIds.has(id)
+    const piece = new THREE.Group()
+    piece.add(
+      mesh(this.#branches.material, branchGeometry(this.model, include)),
+      mesh(this.#leaves.material, leafGeometry(this.model, include)),
+    )
+    return piece
+  }
+
+  /** World positions of the leaf centres on some branches. */
+  leafCenters(branchIds: ReadonlySet<number>): THREE.Vector3[] {
+    this.updateMatrixWorld()
+    return this.model.leaves
+      .filter(leaf => branchIds.has(leaf.branch))
+      .map(leaf =>
+        new THREE.Vector3(0, leaf.size / 2, 0)
+          .applyEuler(leaf.orientation)
+          .add(leaf.origin)
+          .applyMatrix4(this.matrixWorld),
+      )
+  }
+
+  get leafMaterial(): THREE.MeshPhongMaterial {
+    return this.#leaves.material
+  }
+
+  #showStumps(removed: ReadonlySet<number>, cuts: readonly number[]): void {
+    for (const child of this.#stumps.children) {
+      if (child instanceof THREE.Mesh) child.geometry.dispose()
+    }
+    this.#stumps.clear()
+    for (const cut of cuts) {
+      const parent = this.model.branches[cut]?.parent
+      if (parent === undefined || removed.has(parent)) continue
+      const pose = stumpPose(this.model, cut)
+      if (!pose) continue
+      // A short stub of branch left above the bark, capped with the cut face,
+      // so the cut reads clearly even when seen from the side.
+      const stubLength = pose.radius * 1.2
+      const turn = new THREE.Quaternion().setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0),
+        pose.normal,
+      )
+      const stub = new THREE.Mesh(
+        new THREE.CylinderGeometry(
+          pose.radius,
+          pose.radius,
+          stubLength,
+          12,
+          1,
+          true,
+        ),
+        this.#branches.material,
+      )
+      stub.quaternion.copy(turn)
+      stub.position
+        .copy(pose.position)
+        .addScaledVector(pose.normal, stubLength / 2)
+      stub.castShadow = true
+
+      const face = new THREE.Mesh(
+        new THREE.CircleGeometry(pose.radius, 20),
+        this.#stumpMaterial,
+      )
+      // CircleGeometry faces +Z; turn it to face along the branch.
+      face.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 0, 1),
+        pose.normal,
+      )
+      face.position.copy(pose.position).addScaledVector(pose.normal, stubLength)
+      this.#stumps.add(stub, face)
+    }
   }
 
   /**
@@ -127,11 +224,18 @@ export class TreeView extends THREE.Group {
       m.geometry.dispose()
       m.material.dispose()
     }
+    for (const child of this.#stumps.children) {
+      if (child instanceof THREE.Mesh) child.geometry.dispose()
+    }
+    this.#stumpMaterial.dispose()
   }
 }
 
-function mesh(material: THREE.MeshPhongMaterial): Mesh {
-  const m = new THREE.Mesh(new THREE.BufferGeometry(), material)
+function mesh(
+  material: THREE.MeshPhongMaterial,
+  geometry: THREE.BufferGeometry = new THREE.BufferGeometry(),
+): Mesh {
+  const m = new THREE.Mesh(geometry, material)
   m.castShadow = true
   m.receiveShadow = true
   return m
