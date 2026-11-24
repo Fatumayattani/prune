@@ -1,10 +1,12 @@
-import {Tree} from '@dgreenheck/ez-tree'
 import * as THREE from 'three'
+import {removedBranches} from '../shared/tree/cut.ts'
+import {generateTree} from '../shared/tree/model.ts'
+import {SPECIES, type Species, treeOptions} from '../shared/tree/species.ts'
+import {TreeView} from './tree/view.ts'
 
-// Spike: render a seeded EZ-Tree tree and measure size and frame rate.
-// Tap anywhere to cycle presets and seeds.
-
-const PRESETS = ['Oak Small', 'Ash Small', 'Pine Small', 'Aspen Small'] as const
+// Temporary test scene: draws the day's tree from our own generator.
+// Tap to cut a random branch; double-tap to change species or seed.
+// Real cutting controls come in the next PR.
 
 const canvas = document.getElementById('scene') as HTMLCanvasElement
 const stats = document.getElementById('stats') as HTMLPreElement
@@ -33,11 +35,11 @@ ground.rotation.x = -Math.PI / 2
 ground.receiveShadow = true
 scene.add(ground)
 
-const tree = new Tree()
-scene.add(tree)
-
-let presetIndex = 0
+let speciesIndex = 0
 let seed = dailySeed(new Date())
+let view: TreeView | undefined
+let cuts: number[] = []
+let info = ''
 
 function dailySeed(date: Date): number {
   const y = date.getUTCFullYear()
@@ -47,21 +49,36 @@ function dailySeed(date: Date): number {
 }
 
 function buildTree(): void {
-  const preset = PRESETS[presetIndex] ?? PRESETS[0]
+  const species: Species = SPECIES[speciesIndex] ?? 'oak'
   const started = performance.now()
-  tree.loadPreset(preset)
-  tree.options.seed = seed
-  tree.generate()
-  tree.traverse(obj => {
-    obj.castShadow = true
-  })
-  const buildMs = performance.now() - started
+  const model = generateTree(treeOptions(species, seed))
+  if (view) {
+    scene.remove(view)
+    view.dispose()
+  }
+  view = new TreeView(model)
+  scene.add(view)
+  cuts = []
+  const ms = performance.now() - started
+  info = `${species} · seed ${seed} · built in ${ms.toFixed(0)} ms`
   frameCamera()
-  info = `${preset} · seed ${seed}\nbuilt in ${buildMs.toFixed(0)} ms`
+}
+
+function cutRandomBranch(): void {
+  if (!view) return
+  const candidates = view.model.branches.filter(b => b.level > 0)
+  const pick = candidates[Math.floor(Math.random() * candidates.length)]
+  if (!pick) return
+  const started = performance.now()
+  cuts.push(pick.id)
+  view.show(removedBranches(view.model, cuts))
+  const ms = performance.now() - started
+  info = `${info.split('\n')[0]}\ncut branch ${pick.id} · rebuilt in ${ms.toFixed(0)} ms`
 }
 
 function frameCamera(): void {
-  const box = new THREE.Box3().setFromObject(tree)
+  if (!view) return
+  const box = new THREE.Box3().setFromObject(view)
   const size = box.getSize(new THREE.Vector3())
   const center = box.getCenter(new THREE.Vector3())
   const fit = Math.max(size.y, size.x / camera.aspect)
@@ -80,30 +97,36 @@ function resize(): void {
   frameCamera()
 }
 
+let lastTap = 0
 canvas.addEventListener('pointerup', () => {
-  presetIndex = (presetIndex + 1) % PRESETS.length
-  if (presetIndex === 0) seed += 1
-  buildTree()
+  const now = performance.now()
+  if (now - lastTap < 300) {
+    speciesIndex = (speciesIndex + 1) % SPECIES.length
+    if (speciesIndex === 0) seed += 1
+    buildTree()
+    lastTap = 0
+    return
+  }
+  lastTap = now
+  cutRandomBranch()
 })
 
-let info = ''
 let frames = 0
-let fps = 0
 let lastFpsTime = performance.now()
 const clock = new THREE.Clock()
 
 function animate(): void {
-  tree.update(clock.getElapsedTime())
+  view?.update(clock.getElapsedTime())
   renderer.render(scene, camera)
 
   frames += 1
   const now = performance.now()
   if (now - lastFpsTime >= 1000) {
-    fps = Math.round((frames * 1000) / (now - lastFpsTime))
+    const fps = Math.round((frames * 1000) / (now - lastFpsTime))
     frames = 0
     lastFpsTime = now
     const tris = renderer.info.render.triangles
-    stats.textContent = `${info}\n${fps} fps · ${tris.toLocaleString()} tris\ntap to change tree`
+    stats.textContent = `${info}\n${fps} fps · ${tris.toLocaleString()} tris\ntap: cut · double-tap: next tree`
   }
 }
 
