@@ -1,16 +1,21 @@
 import * as THREE from 'three'
+import {leafCenter, leavesOutside, score} from '../shared/puzzle/score.ts'
+import {ellipse, type Shape} from '../shared/puzzle/shape.ts'
 import {remainingLeafCount, subtree} from '../shared/tree/cut.ts'
 import {CutHistory} from '../shared/tree/history.ts'
 import {generateTree} from '../shared/tree/model.ts'
 import {SPECIES, type Species, treeOptions} from '../shared/tree/species.ts'
 import {buzz, playSnip, playThud} from './sound.ts'
 import {CutEffects} from './tree/effects.ts'
+import {outlineMesh} from './tree/outline.ts'
 import {pickBranch} from './tree/pick.ts'
 import {stumpPose} from './tree/stump.ts'
 import {TreeView} from './tree/view.ts'
 
 // Tap a branch to select it (it turns red with everything growing from it),
 // tap it again to cut. Tap empty space to deselect. Undo takes back a cut.
+// Leaves outside the target shape are tinted amber; the goal is to cut until
+// none are left outside while keeping as many leaves as possible.
 
 /** How far from a branch a tap still counts, in CSS pixels. */
 const TAP_REACH = 28
@@ -31,7 +36,9 @@ renderer.shadowMap.enabled = true
 const scene = new THREE.Scene()
 scene.background = new THREE.Color(0xe9e4d8)
 
-const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 500)
+// A narrow, distant camera keeps perspective low, so what you see matches
+// the flat front view the score uses.
+const camera = new THREE.PerspectiveCamera(22, 1, 1, 2000)
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x8a7a5c, 1.2))
 const sun = new THREE.DirectionalLight(0xffffff, 2)
@@ -55,6 +62,8 @@ let seed = dailySeed(new Date())
 let view: TreeView | undefined
 let history: CutHistory | undefined
 let selected: number | undefined
+let shape: Shape | undefined
+let outline: THREE.Mesh | undefined
 let info = ''
 
 function dailySeed(date: Date): number {
@@ -75,18 +84,50 @@ function buildTree(): void {
   history = new CutHistory(model)
   selected = undefined
   scene.add(view)
+
+  shape = placeholderShape(view)
+  if (outline) {
+    scene.remove(outline)
+    outline.geometry.dispose()
+  }
+  outline = outlineMesh(shape, backOfTree(view) - 1, 0.35)
+  scene.add(outline)
   info = `${species} · seed ${seed}`
   frameCamera()
   refresh()
 }
 
+/**
+ * Temporary target until daily shapes are generated: an ellipse over the
+ * crown, a bit smaller than the tree so some cutting is needed.
+ */
+function placeholderShape(tree: TreeView): Shape {
+  const centers = tree.model.leaves.map(leafCenter)
+  const xs = centers.map(c => c.x)
+  const ys = centers.map(c => c.y)
+  const minX = Math.min(...xs)
+  const maxX = Math.max(...xs)
+  const minY = Math.min(...ys)
+  const maxY = Math.max(...ys)
+  return ellipse(
+    [(minX + maxX) / 2, (minY + maxY) / 2],
+    ((maxX - minX) / 2) * 0.8,
+    ((maxY - minY) / 2) * 0.85,
+  )
+}
+
+function backOfTree(tree: TreeView): number {
+  return new THREE.Box3().setFromObject(tree).min.z
+}
+
 /** Redraws the tree and updates the text and buttons to match the state. */
 function refresh(): void {
-  if (!view || !history) return
+  if (!view || !history || !shape) return
   const started = performance.now()
   const selection =
     selected === undefined ? new Set<number>() : subtree(view.model, selected)
-  view.show(history.removed, selection, history.cuts)
+  const outside = leavesOutside(view.model, history.removed, shape)
+  view.show(history.removed, selection, history.cuts, outside)
   const ms = performance.now() - started
 
   const count = history.cuts.length
@@ -94,7 +135,15 @@ function refresh(): void {
   undoButton.disabled = count === 0
 
   if (selected === undefined) {
-    hint.textContent = 'Tap a branch to select it'
+    const result = score(view.model, history.cuts, shape)
+    const keptShare = Math.round((result.kept / result.total) * 100)
+    if (result.fits) {
+      hint.textContent = `It fits! ${keptShare}% of leaves kept`
+    } else if (history.cuts.length === 0) {
+      hint.textContent = `Trim the amber leaves to fit the shape`
+    } else {
+      hint.textContent = `${result.outside} leaves still outside · ${keptShare}% kept`
+    }
   } else {
     const before = remainingLeafCount(view.model, history.removed)
     const after = remainingLeafCount(
@@ -147,6 +196,7 @@ function cut(branchId: number): void {
 function frameCamera(): void {
   if (!view) return
   const box = new THREE.Box3().setFromObject(view)
+  if (outline) box.expandByObject(outline)
   const size = box.getSize(new THREE.Vector3())
   const center = box.getCenter(new THREE.Vector3())
   const fit = Math.max(size.y, size.x / camera.aspect)

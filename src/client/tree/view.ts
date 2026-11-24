@@ -4,7 +4,12 @@
 // ported from EZ-Tree (MIT, Daniel Greenheck).
 
 import * as THREE from 'three'
-import {leafQuads, type TreeModel} from '../../shared/tree/model.ts'
+import {leafCenter} from '../../shared/puzzle/score.ts'
+import {
+  type LeafNode,
+  leafQuads,
+  type TreeModel,
+} from '../../shared/tree/model.ts'
 import type {Point, Target} from './pick.ts'
 import {ringsTexture} from './rings.ts'
 import {stumpPose} from './stump.ts'
@@ -12,6 +17,8 @@ import {barkTextures, leafTexture} from './textures.ts'
 import {addWind} from './wind.ts'
 
 const HIGHLIGHT = 0xff5a3c
+/** Tint for leaves that stick out of the target shape. */
+const OUTSIDE = 0xffb03a
 
 type Mesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhongMaterial>
 
@@ -21,6 +28,7 @@ export class TreeView extends THREE.Group {
   readonly #leaves: Mesh
   readonly #selectedBranches: Mesh
   readonly #selectedLeaves: Mesh
+  readonly #outsideLeaves: Mesh
   readonly #stumps = new THREE.Group()
   readonly #stumpMaterial: THREE.MeshPhongMaterial
   readonly #time = {value: 0}
@@ -59,11 +67,16 @@ export class TreeView extends THREE.Group {
     selectedLeaf.color.set(HIGHLIGHT)
     selectedLeaf.emissive.set(HIGHLIGHT).multiplyScalar(0.35)
     addWind(selectedLeaf, this.#time)
+    const outsideLeaf = leafMaterial.clone()
+    outsideLeaf.color.set(OUTSIDE)
+    outsideLeaf.emissive.set(OUTSIDE).multiplyScalar(0.25)
+    addWind(outsideLeaf, this.#time)
 
     this.#branches = mesh(barkMaterial)
     this.#leaves = mesh(leafMaterial)
     this.#selectedBranches = mesh(selectedBark)
     this.#selectedLeaves = mesh(selectedLeaf)
+    this.#outsideLeaves = mesh(outsideLeaf)
     this.#stumpMaterial = new THREE.MeshPhongMaterial({
       name: 'stumps',
       map: ringsTexture(),
@@ -74,26 +87,45 @@ export class TreeView extends THREE.Group {
       this.#leaves,
       this.#selectedBranches,
       this.#selectedLeaves,
+      this.#outsideLeaves,
       this.#stumps,
     )
-    this.show(new Set(), new Set(), [])
+    this.show(new Set(), new Set(), [], new Set())
   }
 
   /**
-   * Rebuilds the geometry: removed branches hidden, selected highlighted,
-   * and a cut face on every cut whose stump is still on the tree.
+   * Rebuilds the geometry: removed branches hidden, selected branches
+   * highlighted, leaves outside the shape tinted (by leaf index), and a cut
+   * face on every cut whose stump is still on the tree.
    */
   show(
     removed: ReadonlySet<number>,
     selected: ReadonlySet<number>,
     cuts: readonly number[],
+    outside: ReadonlySet<number>,
   ): void {
     const normal = (id: number) => !removed.has(id) && !selected.has(id)
     const highlighted = (id: number) => !removed.has(id) && selected.has(id)
     replace(this.#branches, branchGeometry(this.model, normal))
-    replace(this.#leaves, leafGeometry(this.model, normal))
+    replace(
+      this.#leaves,
+      leafGeometry(
+        this.model,
+        (leaf, i) => normal(leaf.branch) && !outside.has(i),
+      ),
+    )
     replace(this.#selectedBranches, branchGeometry(this.model, highlighted))
-    replace(this.#selectedLeaves, leafGeometry(this.model, highlighted))
+    replace(
+      this.#selectedLeaves,
+      leafGeometry(this.model, leaf => highlighted(leaf.branch)),
+    )
+    replace(
+      this.#outsideLeaves,
+      leafGeometry(
+        this.model,
+        (leaf, i) => normal(leaf.branch) && outside.has(i),
+      ),
+    )
     this.#showStumps(removed, cuts)
   }
 
@@ -106,7 +138,10 @@ export class TreeView extends THREE.Group {
     const piece = new THREE.Group()
     piece.add(
       mesh(this.#branches.material, branchGeometry(this.model, include)),
-      mesh(this.#leaves.material, leafGeometry(this.model, include)),
+      mesh(
+        this.#leaves.material,
+        leafGeometry(this.model, leaf => include(leaf.branch)),
+      ),
     )
     return piece
   }
@@ -116,12 +151,7 @@ export class TreeView extends THREE.Group {
     this.updateMatrixWorld()
     return this.model.leaves
       .filter(leaf => branchIds.has(leaf.branch))
-      .map(leaf =>
-        new THREE.Vector3(0, leaf.size / 2, 0)
-          .applyEuler(leaf.orientation)
-          .add(leaf.origin)
-          .applyMatrix4(this.matrixWorld),
-      )
+      .map(leaf => leafCenter(leaf).applyMatrix4(this.matrixWorld))
   }
 
   get leafMaterial(): THREE.MeshPhongMaterial {
@@ -202,10 +232,7 @@ export class TreeView extends THREE.Group {
     }
     for (const leaf of this.model.leaves) {
       if (removed.has(leaf.branch)) continue
-      const center = new THREE.Vector3(0, leaf.size / 2, 0)
-        .applyEuler(leaf.orientation)
-        .add(leaf.origin)
-      targets.push({branch: leaf.branch, points: [toScreen(center)]})
+      targets.push({branch: leaf.branch, points: [toScreen(leafCenter(leaf))]})
     }
     return targets
   }
@@ -220,6 +247,7 @@ export class TreeView extends THREE.Group {
       this.#leaves,
       this.#selectedBranches,
       this.#selectedLeaves,
+      this.#outsideLeaves,
     ]) {
       m.geometry.dispose()
       m.material.dispose()
@@ -302,15 +330,15 @@ function branchGeometry(
 
 function leafGeometry(
   model: TreeModel,
-  include: (branchId: number) => boolean,
+  include: (leaf: LeafNode, index: number) => boolean,
 ): THREE.BufferGeometry {
   const verts: number[] = []
   const uvs: number[] = []
   const indices: number[] = []
   const quads = leafQuads(model.options)
 
-  for (const leaf of model.leaves) {
-    if (!include(leaf.branch)) continue
+  model.leaves.forEach((leaf, index) => {
+    if (!include(leaf, index)) return
     const w = leaf.size
     const l = leaf.size
     for (let q = 0; q < quads; q++) {
@@ -328,7 +356,7 @@ function leafGeometry(
       uvs.push(0, 1, 0, 0, 1, 0, 1, 1)
       indices.push(i, i + 1, i + 2, i, i + 2, i + 3)
     }
-  }
+  })
 
   const geometry = new THREE.BufferGeometry()
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3))
